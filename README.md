@@ -1,8 +1,6 @@
-# dual-responsive-nanotherapy
-Computational framework for modeling and optimizing pH/ROS dual-responsive nanoparticle drug delivery systems for targeted atherosclerosis therapy. Includes MATLAB simulations, parameter optimization, Monte Carlo uncertainty analysis, sensitivity analysis, and disease-stage modeling.n
+# dual-responsive-nanotherapy research project
+*Computational Optimization of pH/ROS Dual-Responsive Nanoparticle Systems for Targeted Atherosclerosis Therapy*
 
-**Computational Optimization of pH/ROS Dual-Responsive Nanoparticle Systems for Targeted Atherosclerosis Therapy
-**
 This repository contains the computational modeling framework, simulation code, and analysis workflows used for investigating pH/ROS dual-responsive nanoparticle systems for targeted atherosclerosis therapy. The project focuses on using mathematical modeling and optimization techniques to predict nanoparticle drug-release behavior under different physiological conditions before experimental synthesis.
 
 The framework integrates:
