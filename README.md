@@ -4,7 +4,6 @@
 This repository contains the computational modeling framework, simulation code, and analysis workflows used for investigating pH/ROS dual-responsive nanoparticle systems for targeted atherosclerosis therapy. The project focuses on using mathematical modeling and optimization techniques to predict nanoparticle drug-release behavior under different physiological conditions before experimental synthesis.
 
 The framework integrates:
-
     pH-responsive degradation kinetics
     ROS-responsive degradation kinetics
     Dual-stimuli synergistic release modeling
@@ -15,7 +14,6 @@ The framework integrates:
     Disease-stage stratification modeling
 
 The simulations compare healthy vascular environments with multiple stages of atherosclerotic plaque progression to evaluate targeting selectivity and release efficiency. Results suggest that dual-responsive nanoparticle systems may provide improved disease-specific drug release compared to single-responsive designs under modeled conditions.
-
     Features
     Mechanistic drug release modeling
     Optimization of nanoparticle design parameters
@@ -25,8 +23,7 @@ The simulations compare healthy vascular environments with multiple stages of at
     Purpose
 
 This project is intended as an in silico research and hypothesis-generation framework for computational nanomedicine and targeted drug delivery system design. The results are simulation-based predictions derived from literature-informed parameters and are not experimentally validated therapeutic outcomes.
-
-    Technologies Used
+Technologies Used
     MATLAB
     ODE45 Solver
     Genetic Algorithms
@@ -35,7 +32,6 @@ This project is intended as an in silico research and hypothesis-generation fram
     Future Work
 
 Future extensions may include:
-
     Experimental nanoparticle synthesis and validation
     Integration of spatial diffusion models
     Machine learning-assisted parameter optimization
