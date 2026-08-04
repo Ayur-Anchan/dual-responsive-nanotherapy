@@ -1,0 +1,1321 @@
+%% TRANSPORT-AWARE COMPUTATIONAL EVALUATION OF RESPONSIVE NANOPARTICLES
+% Author: Ayur Anchan
+% PURPOSE
+% This script implements a reproducible, transport-aware framework. It models nanoparticle-bound and free drug in
+% blood, the mononuclear phagocyte system (MPS), healthy arterial wall,
+% plaque cap, and plaque core. It also performs an internal held-out release
+% benchmark, multi-objective design screening, uncertainty analysis, and a
+% variance-based Jansen/Saltelli global sensitivity analysis.
+% IMPORTANT INTERPRETATION
+% The outputs are normalized exposure proxies, not clinical predictions.
+% Scenario pH/ROS values are exploratory assumptions rather than measured
+% patient stages. Experimental and independent external validation remain
+% necessary before biological or translational conclusions can be made.
+
+clear; clc; close all;
+rng(42, 'twister');
+
+fprintf('\n============================================================\n');
+fprintf('TRANSPORT-AWARE RESPONSIVE NANOPARTICLE MODEL\n');
+fprintf('============================================================\n');
+
+%% SECTION 1. USER SETTINGS AND OUTPUT DIRECTORY
+% Publication for the full manuscript sample sizes.
+% Quick for a faster diagnostic run while editing the code.
+settings.profile = 'publication';
+settings.analysis_time_h = 72;
+settings.initial_normalized_dose = 1.0;
+settings.save_figures = true;
+settings.figure_resolution_dpi = 600;
+settings.output_directory = fullfile(pwd, 'publication_outputs');
+
+% Assign sample sizes according to the selected profile.
+if strcmpi(settings.profile, 'quick')
+    settings.n_candidates = 600;
+    settings.n_monte_carlo = 500;
+    settings.n_sobol = 128;
+else
+    settings.n_candidates = 3000;
+    settings.n_monte_carlo = 5000;
+    settings.n_sobol = 2048;
+end
+
+% Create the output directory if it does not already exist.
+if ~exist(settings.output_directory, 'dir')
+    mkdir(settings.output_directory);
+end
+
+fprintf('Profile: %s\n', settings.profile);
+fprintf('Output directory: %s\n\n', settings.output_directory);
+
+%% SECTION 2. INTERNAL HELD-OUT ROS RELEASE BENCHMARK
+% These values are approximate digitizations of Yang et al. (2025), Fig. 1f.
+% Four H2O2 concentrations are used for calibration. The 5 mM curve is held
+% out completely and predicted after fitting. This is an internal held-out
+% concentration benchmark, not independent external validation.
+benchmark.time_h = [0 0.5 1 2 4 8 24 30 48 72]';
+benchmark.ros_mM = [0 2.5 5 7.5 10]';
+benchmark.release_fraction = [ ...
+    0 0.01 0.03 0.07 0.09 0.10 0.12 0.13 0.14 0.15; ...
+    0 0.09 0.12 0.16 0.21 0.26 0.31 0.32 0.34 0.35; ...
+    0 0.21 0.25 0.29 0.35 0.41 0.47 0.48 0.49 0.50; ...
+    0 0.30 0.36 0.40 0.46 0.55 0.58 0.59 0.61 0.62; ...
+    0 0.41 0.48 0.53 0.59 0.65 0.70 0.72 0.74 0.742];
+
+% Mark the 5 mM row as the blind holdout and all other rows as training data.
+holdout_index = 3;
+training_indices = setdiff(1:numel(benchmark.ros_mM), holdout_index);
+
+% Define physically bounded parameters for the reduced in-vitro benchmark.
+% Parameter order: k0, kmax, K, Hill n, F0, release amplitude, KF, Hill m.
+benchmark_lower = [0.001 0.001 0.05 0.5 0.05 0.10 0.10 0.5];
+benchmark_upper = [0.800 1.500 20.0 4.0 0.30 0.80 20.0 4.0];
+benchmark_initial = [0.05 0.30 3.0 1.2 0.12 0.65 3.0 1.2];
+benchmark_theta0 = bounded_to_unconstrained(benchmark_initial, benchmark_lower, benchmark_upper);
+
+% Fit only the four training concentrations with fminsearch.
+benchmark_objective = @(theta) ros_benchmark_sse(theta, benchmark, ...
+    training_indices, benchmark_lower, benchmark_upper);
+benchmark_options = optimset('Display', 'off', 'MaxIter', 20000, ...
+    'MaxFunEvals', 100000, 'TolX', 1e-10, 'TolFun', 1e-12);
+benchmark_theta = fminsearch(benchmark_objective, benchmark_theta0, benchmark_options);
+benchmark_parameters = unconstrained_to_bounded(benchmark_theta, benchmark_lower, benchmark_upper);
+
+% Predict the withheld 5 mM curve without refitting to it.
+holdout_prediction = ros_benchmark_model(benchmark_parameters, ...
+    benchmark.time_h, benchmark.ros_mM(holdout_index));
+holdout_observed = benchmark.release_fraction(holdout_index, :)';
+holdout_rmse = sqrt(mean((holdout_prediction - holdout_observed).^2));
+holdout_r2 = 1 - sum((holdout_prediction - holdout_observed).^2) / ...
+    sum((holdout_observed - mean(holdout_observed)).^2);
+
+fprintf('INTERNAL HELD-OUT BENCHMARK\n');
+fprintf('Withheld concentration: %.1f mM H2O2\n', benchmark.ros_mM(holdout_index));
+fprintf('Holdout RMSE: %.4f release fraction\n', holdout_rmse);
+fprintf('Holdout R^2: %.4f\n\n', holdout_r2);
+
+% Save the benchmark metrics and predictions for transparent inspection.
+benchmark_table = table(benchmark.time_h, holdout_observed, holdout_prediction, ...
+    'VariableNames', {'Time_h','Observed_Holdout','Predicted_Holdout'});
+writetable(benchmark_table, fullfile(settings.output_directory, 'holdout_predictions.csv'));
+
+
+%% SECTION 2B. LEAVE-ONE-CONCENTRATION-OUT RELEASE CROSS-VALIDATION
+% Refit the reduced release model five times, withholding one complete ROS
+% concentration curve on each pass. This reveals both interpolation strength
+% and extrapolation failure instead of relying on a single favorable holdout.
+loco_rows = cell(numel(benchmark.ros_mM), 4);
+for excluded_index = 1:numel(benchmark.ros_mM)
+    loco_training_indices = setdiff(1:numel(benchmark.ros_mM), excluded_index);
+    loco_objective = @(theta) ros_benchmark_sse(theta, benchmark, ...
+        loco_training_indices, benchmark_lower, benchmark_upper);
+    loco_theta = fminsearch(loco_objective, benchmark_theta0, benchmark_options);
+    loco_parameters = unconstrained_to_bounded(loco_theta, benchmark_lower, benchmark_upper);
+    loco_prediction = ros_benchmark_model(loco_parameters, benchmark.time_h, ...
+        benchmark.ros_mM(excluded_index));
+    loco_observed = benchmark.release_fraction(excluded_index, :)';
+    loco_rmse = sqrt(mean((loco_prediction-loco_observed).^2));
+    loco_denominator = sum((loco_observed-mean(loco_observed)).^2);
+    loco_r2 = 1 - sum((loco_prediction-loco_observed).^2) / max(loco_denominator, eps);
+    if benchmark.ros_mM(excluded_index) == 0
+        holdout_type = 'boundary extrapolation';
+    else
+        holdout_type = 'stimulated concentration';
+    end
+    loco_rows(excluded_index,:) = {benchmark.ros_mM(excluded_index), ...
+        loco_rmse, loco_r2, holdout_type};
+end
+loco_table = cell2table(loco_rows, 'VariableNames', ...
+    {'HeldOut_ROS_mM','RMSE','R2','Holdout_Type'});
+writetable(loco_table, fullfile(settings.output_directory, ...
+    'leave_one_concentration_out_cross_validation.csv'));
+
+stimulated_rows = loco_table.HeldOut_ROS_mM > 0;
+fprintf('LEAVE-ONE-CONCENTRATION-OUT CROSS-VALIDATION\n');
+fprintf('Stimulated-curve R^2 range: %.3f to %.3f\n', ...
+    min(loco_table.R2(stimulated_rows)), max(loco_table.R2(stimulated_rows)));
+fprintf('0 mM boundary-extrapolation R^2: %.3f\n\n', ...
+    loco_table.R2(loco_table.HeldOut_ROS_mM == 0));
+
+%% SECTION 2C. pH-RESPONSE CALIBRATION-SHAPE CHECK
+% Approximate digitized release fractions from Erensoy et al. (2024) are used
+% only to test whether a simple first-order plateau model can reproduce the
+% acidic-versus-neutral ordering of a different pH-responsive formulation.
+% This dataset is not used to calibrate the transport model and is not treated
+% as external validation of the conceptual simvastatin carrier.
+ph_benchmark.time_h = [0 1 2 3 4 6 8 10 12 14 16 18 20 22 24]';
+ph_benchmark.release_pH74 = [0 0.07 0.13 0.17 0.20 0.245 0.270 0.285 ...
+    0.295 0.302 0.307 0.311 0.314 0.316 0.318]';
+ph_benchmark.release_pH60 = [0 0.13 0.22 0.30 0.36 0.45 0.51 0.56 ...
+    0.59 0.615 0.635 0.650 0.665 0.680 0.690]';
+
+ph_lower = [0.10 0.005];       % plateau fraction and first-order rate
+ph_upper = [1.00 1.000];
+ph74_initial = [0.32 0.25];
+ph60_initial = [0.70 0.18];
+ph74_theta = fminsearch(@(theta) plateau_release_sse(theta, ...
+    ph_benchmark.time_h, ph_benchmark.release_pH74, ph_lower, ph_upper), ...
+    bounded_to_unconstrained(ph74_initial,ph_lower,ph_upper), benchmark_options);
+ph60_theta = fminsearch(@(theta) plateau_release_sse(theta, ...
+    ph_benchmark.time_h, ph_benchmark.release_pH60, ph_lower, ph_upper), ...
+    bounded_to_unconstrained(ph60_initial,ph_lower,ph_upper), benchmark_options);
+ph74_parameters = unconstrained_to_bounded(ph74_theta,ph_lower,ph_upper);
+ph60_parameters = unconstrained_to_bounded(ph60_theta,ph_lower,ph_upper);
+ph74_prediction = plateau_release_model(ph74_parameters,ph_benchmark.time_h);
+ph60_prediction = plateau_release_model(ph60_parameters,ph_benchmark.time_h);
+ph74_rmse = sqrt(mean((ph74_prediction-ph_benchmark.release_pH74).^2));
+ph60_rmse = sqrt(mean((ph60_prediction-ph_benchmark.release_pH60).^2));
+ph_table = table(ph_benchmark.time_h, ph_benchmark.release_pH74, ...
+    ph74_prediction, ph_benchmark.release_pH60, ph60_prediction, ...
+    'VariableNames', {'Time_h','Observed_pH74','Predicted_pH74', ...
+    'Observed_pH60','Predicted_pH60'});
+writetable(ph_table, fullfile(settings.output_directory,'ph_shape_check.csv'));
+
+%% SECTION 3. EXPLORATORY PLAQUE-LIKE MICROENVIRONMENT SCENARIOS
+% Exact pH and ROS values are treated as exploratory inputs rather than
+% validated clinical disease stages.
+% ROS is expressed in mM so that the model is compatible with the benchmark.
+% Construct all four scenarios simultaneously. This avoids subscripted
+% structure assignment entirely, so MATLAB cannot encounter dissimilar
+% structures even when the script is pasted into a new editor file.
+scenario_names = {'Subclinical-like', 'Early plaque-like', ...
+    'Moderate plaque-like', 'Advanced plaque-like'};
+scenario_cap_pH = num2cell([7.05, 6.90, 6.70, 6.60]);
+scenario_cap_ROS_mM = num2cell([0.02, 0.05, 0.10, 0.15]);
+scenario_core_pH = num2cell([6.95, 6.70, 6.45, 6.25]);
+scenario_core_ROS_mM = num2cell([0.04, 0.10, 0.25, 0.40]);
+scenario_k_plaque_in = num2cell([0.006, 0.010, 0.014, 0.016]);
+scenario_k_cap_core = num2cell([0.010, 0.012, 0.008, 0.004]);
+
+scenarios = struct( ...
+    'name', scenario_names, ...
+    'cap_pH', scenario_cap_pH, ...
+    'cap_ROS_mM', scenario_cap_ROS_mM, ...
+    'core_pH', scenario_core_pH, ...
+    'core_ROS_mM', scenario_core_ROS_mM, ...
+    'k_plaque_in', scenario_k_plaque_in, ...
+    'k_cap_core', scenario_k_cap_core);
+
+% Use the early plaque-like scenario only as the design-screening condition.
+design_scenario = scenarios(2);
+
+%% SECTION 4. SYSTEMIC TRANSPORT AND CLEARANCE PARAMETERS
+% Each rate is an exploratory first-order rate constant in h^-1.
+% These values provide a transparent reference model; they are not presented
+% as patient-specific measurements. Uncertainty analysis perturbs the major
+% transport, clearance, and microenvironment parameters.
+transport = default_transport_parameters();
+
+%% SECTION 5. DIMENSIONALLY CONSISTENT RELEASE MODEL
+% Design vector order:
+% [k_leak, k_pH, pH50, k_ROS, K_ROS_mM, k_interaction]
+%
+% The release equation is:
+% k_release = k_leak + k_pH*f_pH + k_ROS*f_ROS
+%             + k_interaction*f_pH*f_ROS
+%
+% f_pH and f_ROS are dimensionless activation functions. Therefore every
+% coefficient has units h^-1. The interaction coefficient is a candidate
+% phenomenological term rather than a measured polymer property.
+design_bounds = [ ...
+    0.001 0.012; ...   % Baseline leakage rate, h^-1
+    0.020 0.120; ...   % Maximum pH-trigger contribution, h^-1
+    6.550 6.950; ...   % pH half-activation point
+    0.020 0.150; ...   % Maximum ROS-trigger contribution, h^-1
+    0.200 2.000; ...   % ROS half-activation concentration, mM
+    0.000 0.060];      % Optional interaction contribution, h^-1
+
+mechanism_codes = {'baseline','pH','ROS','dual_additive','dual_interaction'};
+mechanism_labels = {'Nonresponsive','pH only','ROS only','Dual additive','Dual + interaction'};
+
+%% SECTION 6. DETERMINISTIC MULTI-OBJECTIVE DESIGN SCREENING
+% A deterministic Halton sequence explores the six-dimensional design space.
+% Designs are evaluated using two independent objectives:
+% 1) maximize plaque free-drug AUC;
+% 2) minimize off-target AUC in blood, healthy wall, and MPS.
+% A knee point is selected from each Pareto front. This avoids optimizing a
+% ratio alone, which can become artificially large if its denominator is tiny.
+halton_candidates = halton_block(settings.n_candidates, 6, 20, first_primes(6));
+design_candidates = design_bounds(:,1)' + halton_candidates .* ...
+    (design_bounds(:,2)' - design_bounds(:,1)');
+
+comparison_rows = cell(numel(mechanism_codes), 12);
+landscapes = struct();
+selected_designs = struct();
+
+fprintf('MULTI-OBJECTIVE SCREENING (%d candidates per mechanism)\n', settings.n_candidates);
+for m = 1:numel(mechanism_codes)
+    mechanism = mechanism_codes{m};
+    plaque_auc = zeros(settings.n_candidates, 1);
+    off_target_auc = zeros(settings.n_candidates, 1);
+    esr = zeros(settings.n_candidates, 1);
+    ser = zeros(settings.n_candidates, 1);
+
+    % Evaluate every candidate with the transport-aware compartment model.
+    for i = 1:settings.n_candidates
+        design = design_candidates(i, :);
+        result = simulate_endpoint(design, mechanism, design_scenario, ...
+            transport, settings.analysis_time_h, settings.initial_normalized_dose);
+        matched_baseline = simulate_endpoint(design, 'baseline', design_scenario, ...
+            transport, settings.analysis_time_h, settings.initial_normalized_dose);
+
+        plaque_auc(i) = result.plaque_auc;
+        off_target_auc(i) = result.off_target_auc;
+        esr(i) = result.exposure_selectivity_ratio;
+        ser(i) = result.exposure_selectivity_ratio / ...
+            max(matched_baseline.exposure_selectivity_ratio, eps);
+    end
+
+    % Identify the nondominated Pareto front and its balanced knee point.
+    [pareto_indices, selected_index] = pareto_knee(plaque_auc, off_target_auc);
+    selected_design = design_candidates(selected_index, :);
+    selected_designs.(mechanism) = selected_design;
+
+    % Store landscapes for plotting and full reproducibility.
+    landscapes.(mechanism).plaque_auc = plaque_auc;
+    landscapes.(mechanism).off_target_auc = off_target_auc;
+    landscapes.(mechanism).pareto_indices = pareto_indices;
+    landscapes.(mechanism).selected_index = selected_index;
+
+    % Collect the selected design and its main metrics in one row.
+    efficiency = plaque_auc(selected_index) / ...
+        (plaque_auc(selected_index) + off_target_auc(selected_index));
+    comparison_rows(m, :) = {mechanism_labels{m}, selected_design(1), selected_design(2), ...
+        selected_design(3), selected_design(4), selected_design(5), selected_design(6), ...
+        plaque_auc(selected_index), off_target_auc(selected_index), ...
+        esr(selected_index), ser(selected_index), efficiency};
+
+    fprintf('%-19s Plaque AUC %.4f | Off-target AUC %.4f | SER %.4f\n', ...
+        mechanism_labels{m}, plaque_auc(selected_index), ...
+        off_target_auc(selected_index), ser(selected_index));
+end
+fprintf('\n');
+
+% Convert mechanism results to a labeled table and save them.
+mechanism_table = cell2table(comparison_rows, 'VariableNames', { ...
+    'Mechanism','k_leak_h_1','k_pH_h_1','pH50','k_ROS_h_1','K_ROS_mM', ...
+    'k_interaction_h_1','Plaque_AUC','OffTarget_AUC','ESR','SER','Exposure_Efficiency'});
+writetable(mechanism_table, fullfile(settings.output_directory, 'mechanism_comparison.csv'));
+
+%% SECTION 7. MICROENVIRONMENT SCENARIO ANALYSIS
+% This section tests whether the model predicts an early optimum. It does not impose such an outcome. The same optimized dual design
+% is evaluated across all exploratory scenarios with no additional fitting.
+selected_dual = selected_designs.dual_interaction;
+scenario_rows = cell(numel(scenarios), 12);
+
+fprintf('PLAQUE-LIKE SCENARIO ANALYSIS\n');
+for i = 1:numel(scenarios)
+    result = simulate_endpoint(selected_dual, 'dual_interaction', scenarios(i), ...
+        transport, settings.analysis_time_h, settings.initial_normalized_dose);
+    matched_baseline = simulate_endpoint(selected_dual, 'baseline', scenarios(i), ...
+        transport, settings.analysis_time_h, settings.initial_normalized_dose);
+    ser_value = result.exposure_selectivity_ratio / ...
+        max(matched_baseline.exposure_selectivity_ratio, eps);
+
+    scenario_rows(i, :) = {scenarios(i).name, scenarios(i).cap_pH, ...
+        scenarios(i).cap_ROS_mM, scenarios(i).core_pH, scenarios(i).core_ROS_mM, ...
+        result.plaque_auc, result.healthy_auc, result.mps_auc, result.blood_auc, ...
+        result.exposure_selectivity_ratio, ser_value, result.exposure_efficiency};
+
+    fprintf('%-22s Plaque AUC %.4f | SER %.4f\n', ...
+        scenarios(i).name, result.plaque_auc, ser_value);
+end
+fprintf('\n');
+
+scenario_table = cell2table(scenario_rows, 'VariableNames', { ...
+    'Scenario','Cap_pH','Cap_ROS_mM','Core_pH','Core_ROS_mM', ...
+    'Plaque_AUC','Healthy_AUC','MPS_AUC','Blood_AUC','ESR','SER','Exposure_Efficiency'});
+writetable(scenario_table, fullfile(settings.output_directory, 'scenario_analysis.csv'));
+
+%% SECTION 7B. EXPOSURE-BASED TARGETING LANDSCAPE
+% This landscape maps tissue-exposure selectivity rather than released-payload
+% ratios:
+%
+% ESR = plaque free-drug AUC / healthy-wall free-drug AUC
+% SER = responsive ESR / matched nonresponsive-carrier ESR
+%
+% Transport and clearance rates are held at the early plaque-like reference
+% values while cap pH and cap ROS are varied. Core pH is set 0.20 units below
+% cap pH, and core ROS is set to twice cap ROS (capped at 0.80 mM). These are
+% explicit exploratory gradient assumptions, not measured clinical mappings.
+map_pH_values = linspace(6.30, 7.40, 35);
+map_ROS_values_mM = logspace(log10(0.005), log10(0.50), 35);
+[map_pH_grid, map_ROS_grid_mM] = meshgrid(map_pH_values, map_ROS_values_mM);
+map_core_pH_grid = max(6.10, map_pH_grid - 0.20);
+map_core_ROS_grid_mM = min(0.80, 2.0 .* map_ROS_grid_mM);
+
+map_plaque_auc = zeros(size(map_pH_grid));
+map_healthy_auc = zeros(size(map_pH_grid));
+map_esr = zeros(size(map_pH_grid));
+map_ser = zeros(size(map_pH_grid));
+map_efficiency = zeros(size(map_pH_grid));
+
+fprintf('EXPOSURE-BASED TARGETING LANDSCAPE\n');
+for row_index = 1:size(map_pH_grid, 1)
+    for column_index = 1:size(map_pH_grid, 2)
+        % Copy the reference scenario so every structure field remains intact.
+        map_scenario = design_scenario;
+        map_scenario.name = 'pH-ROS landscape point';
+        map_scenario.cap_pH = map_pH_grid(row_index, column_index);
+        map_scenario.cap_ROS_mM = map_ROS_grid_mM(row_index, column_index);
+        map_scenario.core_pH = map_core_pH_grid(row_index, column_index);
+        map_scenario.core_ROS_mM = map_core_ROS_grid_mM(row_index, column_index);
+
+        % Evaluate the selected responsive design and its matched baseline.
+        responsive_map_result = simulate_endpoint(selected_dual, ...
+            'dual_interaction', map_scenario, transport, ...
+            settings.analysis_time_h, settings.initial_normalized_dose);
+        baseline_map_result = simulate_endpoint(selected_dual, ...
+            'baseline', map_scenario, transport, ...
+            settings.analysis_time_h, settings.initial_normalized_dose);
+
+        map_plaque_auc(row_index, column_index) = responsive_map_result.plaque_auc;
+        map_healthy_auc(row_index, column_index) = responsive_map_result.healthy_auc;
+        map_esr(row_index, column_index) = ...
+            responsive_map_result.exposure_selectivity_ratio;
+        map_ser(row_index, column_index) = ...
+            responsive_map_result.exposure_selectivity_ratio / ...
+            max(baseline_map_result.exposure_selectivity_ratio, eps);
+        map_efficiency(row_index, column_index) = ...
+            responsive_map_result.exposure_efficiency;
+    end
+end
+
+% Locate the highest SER only as a descriptive grid result, not as a clinical
+% optimum. Ratio maxima must be interpreted together with absolute plaque AUC.
+[map_max_ser, map_max_linear_index] = max(map_ser(:));
+[map_max_row, map_max_column] = ind2sub(size(map_ser), map_max_linear_index);
+map_max_pH = map_pH_grid(map_max_row, map_max_column);
+map_max_ROS_mM = map_ROS_grid_mM(map_max_row, map_max_column);
+map_max_plaque_auc = map_plaque_auc(map_max_row, map_max_column);
+
+fprintf('Maximum grid SER: %.4f at cap pH %.3f and cap ROS %.4f mM\n', ...
+    map_max_ser, map_max_pH, map_max_ROS_mM);
+fprintf('Plaque AUC at that grid point: %.4f\n\n', map_max_plaque_auc);
+
+% Save every map point so the heatmap can be audited or replotted.
+targeting_map_table = table( ...
+    map_pH_grid(:), map_ROS_grid_mM(:), ...
+    map_core_pH_grid(:), map_core_ROS_grid_mM(:), ...
+    map_plaque_auc(:), map_healthy_auc(:), map_esr(:), map_ser(:), ...
+    map_efficiency(:), ...
+    'VariableNames', {'Cap_pH','Cap_ROS_mM','Core_pH','Core_ROS_mM', ...
+    'Plaque_AUC','Healthy_AUC','ESR','SER','Exposure_Efficiency'});
+writetable(targeting_map_table, ...
+    fullfile(settings.output_directory, 'exposure_targeting_landscape.csv'));
+
+%% SECTION 8. STRUCTURAL MODEL COMPARISON: ADDITIVE VS INTERACTION
+% The interaction term is treated as a candidate model structure, not a
+% measured polymer property. Its incremental value is quantified directly.
+row_additive = strcmp(mechanism_table.Mechanism, 'Dual additive');
+row_interaction = strcmp(mechanism_table.Mechanism, 'Dual + interaction');
+interaction_plaque_gain_pct = 100 * (mechanism_table.Plaque_AUC(row_interaction) / ...
+    mechanism_table.Plaque_AUC(row_additive) - 1);
+interaction_offtarget_gain_pct = 100 * (mechanism_table.OffTarget_AUC(row_interaction) / ...
+    mechanism_table.OffTarget_AUC(row_additive) - 1);
+interaction_ser_gain_pct = 100 * (mechanism_table.SER(row_interaction) / ...
+    mechanism_table.SER(row_additive) - 1);
+
+fprintf('INTERACTION-TERM INCREMENT OVER ADDITIVE DUAL MODEL\n');
+fprintf('Plaque AUC change: %.2f%%\n', interaction_plaque_gain_pct);
+fprintf('Off-target AUC change: %.2f%%\n', interaction_offtarget_gain_pct);
+fprintf('SER change: %.2f%%\n\n', interaction_ser_gain_pct);
+
+
+%% SECTION 8B. STRUCTURAL AND NUMERICAL VERIFICATION
+% Track all irreversible loss and elimination in a mass sink. Verify that the
+% dynamic states remain nonnegative, total modeled mass is conserved, and the
+% matrix-exponential endpoint agrees with an independent ode45 integration.
+verification_matrix = build_system_matrix(selected_dual, 'dual_interaction', ...
+    design_scenario, transport);
+verification_initial = zeros(15,1);
+verification_initial(1) = settings.initial_normalized_dose;
+verification_times = linspace(0,settings.analysis_time_h,145)';
+verification_states = zeros(numel(verification_times),15);
+for verification_index = 1:numel(verification_times)
+    verification_states(verification_index,:) = ...
+        (expm(verification_matrix*verification_times(verification_index)) * ...
+        verification_initial)';
+end
+verification_mass = sum(verification_states(:,1:10),2) + verification_states(:,15);
+max_mass_balance_error = max(abs(verification_mass-settings.initial_normalized_dose));
+minimum_dynamic_state = min(verification_states(:,1:10),[],'all');
+
+ode_options = odeset('RelTol',1e-10,'AbsTol',1e-12);
+[~,ode_states] = ode45(@(time,state) verification_matrix*state, ...
+    [0 settings.analysis_time_h], verification_initial, ode_options);
+expm_endpoint = expm(verification_matrix*settings.analysis_time_h) * verification_initial;
+max_solver_endpoint_difference = max(abs(ode_states(end,:)'-expm_endpoint));
+
+verification_table = table(max_mass_balance_error, minimum_dynamic_state, ...
+    max_solver_endpoint_difference, ...
+    'VariableNames', {'Max_Mass_Balance_Error','Minimum_Dynamic_State', ...
+    'Max_ODE45_vs_EXPM_Endpoint_Difference'});
+writetable(verification_table, fullfile(settings.output_directory, ...
+    'numerical_verification.csv'));
+
+if max_mass_balance_error > 1e-9 || minimum_dynamic_state < -1e-10 || ...
+        max_solver_endpoint_difference > 1e-8
+    error('Numerical verification failed. Inspect numerical_verification.csv.');
+end
+fprintf('NUMERICAL VERIFICATION\n');
+fprintf('Maximum mass-balance error: %.3e\n',max_mass_balance_error);
+fprintf('Minimum dynamic state: %.3e\n',minimum_dynamic_state);
+fprintf('Maximum ode45-expm endpoint difference: %.3e\n\n', ...
+    max_solver_endpoint_difference);
+
+%% SECTION 9. DETERMINISTIC MONTE CARLO UNCERTAINTY ANALYSIS
+% A Halton sequence is transformed to standard-normal deviates. The analysis
+% varies design rates, pH threshold, plaque pH/ROS, plaque entry and cap-core
+% transport, MPS uptake, healthy-wall uptake, and elimination rates.
+% The same uncertainty draw is applied to the optimized dual and ROS-only
+% designs so their tradeoff can be compared fairly.
+selected_ros = selected_designs.ROS;
+mc_uniform = halton_block(settings.n_monte_carlo, 24, 100, first_primes(24));
+mc_z = sqrt(2) .* erfinv(max(min(2 .* mc_uniform - 1, 0.999999999999), -0.999999999999));
+mc_values = zeros(settings.n_monte_carlo, 10);
+
+fprintf('MONTE CARLO ANALYSIS (%d deterministic draws)\n', settings.n_monte_carlo);
+for i = 1:settings.n_monte_carlo
+    % Copy the reference scenario and perturb its microenvironment.
+    sampled_scenario = design_scenario;
+    sampled_scenario.cap_pH = clip_value(sampled_scenario.cap_pH + 0.10 * mc_z(i,7), 6.5, 7.3);
+    sampled_scenario.core_pH = clip_value(sampled_scenario.core_pH + 0.12 * mc_z(i,8), 6.1, 7.2);
+    sampled_scenario.cap_ROS_mM = sampled_scenario.cap_ROS_mM * lognormal_multiplier(mc_z(i,9), 0.35);
+    sampled_scenario.core_ROS_mM = sampled_scenario.core_ROS_mM * lognormal_multiplier(mc_z(i,10), 0.35);
+    sampled_scenario.k_plaque_in = sampled_scenario.k_plaque_in * lognormal_multiplier(mc_z(i,11), 0.30);
+    sampled_scenario.k_cap_core = sampled_scenario.k_cap_core * lognormal_multiplier(mc_z(i,12), 0.40);
+
+    % Copy the transport parameters and perturb major uncertain processes.
+    sampled_transport = transport;
+    sampled_transport.k_mps = sampled_transport.k_mps * lognormal_multiplier(mc_z(i,13), 0.25);
+    sampled_transport.k_h_in = sampled_transport.k_h_in * lognormal_multiplier(mc_z(i,14), 0.25);
+    sampled_transport.k_d_h_in = sampled_transport.k_d_h_in * lognormal_multiplier(mc_z(i,15), 0.25);
+    sampled_transport.k_p_out = sampled_transport.k_p_out * lognormal_multiplier(mc_z(i,16), 0.25);
+    sampled_transport.k_elim_b = sampled_transport.k_elim_b * lognormal_multiplier(mc_z(i,17), 0.20);
+    sampled_transport.k_elim_p = sampled_transport.k_elim_p * lognormal_multiplier(mc_z(i,18), 0.20);
+    sampled_transport.k_elim_mps = sampled_transport.k_elim_mps * lognormal_multiplier(mc_z(i,19), 0.20);
+
+    % Apply common manufacturing variation to corresponding design parameters.
+    sampled_dual = selected_dual;
+    sampled_ros = selected_ros;
+    varied_indices = [1 2 4 5 6];
+    for j = 1:numel(varied_indices)
+        parameter_index = varied_indices(j);
+        multiplier = lognormal_multiplier(mc_z(i,j), 0.15);
+        sampled_dual(parameter_index) = sampled_dual(parameter_index) * multiplier;
+        sampled_ros(parameter_index) = sampled_ros(parameter_index) * multiplier;
+    end
+    sampled_dual(3) = clip_value(sampled_dual(3) + 0.08 * mc_z(i,6), 6.45, 7.05);
+    sampled_ros(3) = clip_value(sampled_ros(3) + 0.08 * mc_z(i,6), 6.45, 7.05);
+    sampled_dual = clip_vector(sampled_dual, design_bounds(:,1)', design_bounds(:,2)');
+    sampled_ros = clip_vector(sampled_ros, design_bounds(:,1)', design_bounds(:,2)');
+
+    % Simulate the dual design and its matched nonresponsive baseline.
+    dual_result = simulate_endpoint(sampled_dual, 'dual_interaction', sampled_scenario, ...
+        sampled_transport, settings.analysis_time_h, settings.initial_normalized_dose);
+    dual_baseline = simulate_endpoint(sampled_dual, 'baseline', sampled_scenario, ...
+        sampled_transport, settings.analysis_time_h, settings.initial_normalized_dose);
+    dual_ser = dual_result.exposure_selectivity_ratio / ...
+        max(dual_baseline.exposure_selectivity_ratio, eps);
+
+    % Simulate the ROS-only design and its matched nonresponsive baseline.
+    ros_result = simulate_endpoint(sampled_ros, 'ROS', sampled_scenario, ...
+        sampled_transport, settings.analysis_time_h, settings.initial_normalized_dose);
+    ros_baseline = simulate_endpoint(sampled_ros, 'baseline', sampled_scenario, ...
+        sampled_transport, settings.analysis_time_h, settings.initial_normalized_dose);
+    ros_ser = ros_result.exposure_selectivity_ratio / ...
+        max(ros_baseline.exposure_selectivity_ratio, eps);
+
+    % Store absolute metrics and direct dual-minus-ROS contrasts.
+    mc_values(i, :) = [dual_result.plaque_auc, dual_result.off_target_auc, ...
+        dual_result.exposure_selectivity_ratio, dual_ser, ...
+        ros_result.plaque_auc, ros_result.off_target_auc, ros_ser, ...
+        dual_result.plaque_auc - ros_result.plaque_auc, ...
+        dual_result.off_target_auc - ros_result.off_target_auc, ...
+        dual_ser - ros_ser];
+end
+
+mc_names = {'Dual_Plaque_AUC','Dual_OffTarget_AUC','Dual_ESR','Dual_SER', ...
+    'ROS_Plaque_AUC','ROS_OffTarget_AUC','ROS_SER', ...
+    'Delta_Plaque_AUC','Delta_OffTarget_AUC','Delta_SER'};
+mc_table = array2table(mc_values, 'VariableNames', mc_names);
+writetable(mc_table, fullfile(settings.output_directory, 'monte_carlo_samples.csv'));
+
+% Calculate percentiles without requiring the Statistics Toolbox.
+mc_summary_values = zeros(numel(mc_names), 6);
+for j = 1:numel(mc_names)
+    values = mc_values(:,j);
+    mc_summary_values(j,:) = [mean(values), std(values), ...
+        empirical_percentile(values, 2.5), empirical_percentile(values, 50), ...
+        empirical_percentile(values, 97.5), mean(values > 0)];
+end
+mc_summary = array2table(mc_summary_values, 'VariableNames', ...
+    {'Mean','SD','P2_5','Median','P97_5','Probability_gt_0'});
+mc_summary.Metric = mc_names';
+mc_summary = movevars(mc_summary, 'Metric', 'Before', 1);
+writetable(mc_summary, fullfile(settings.output_directory, 'monte_carlo_summary.csv'));
+
+fprintf('Dual SER 95%% interval: [%.3f, %.3f]\n', ...
+    empirical_percentile(mc_values(:,4),2.5), empirical_percentile(mc_values(:,4),97.5));
+fprintf('P(dual plaque AUC > ROS plaque AUC): %.1f%%\n', 100*mean(mc_values(:,8)>0));
+fprintf('P(dual off-target AUC > ROS off-target AUC): %.1f%%\n', 100*mean(mc_values(:,9)>0));
+fprintf('P(dual SER > ROS SER): %.1f%%\n\n', 100*mean(mc_values(:,10)>0));
+
+%% SECTION 10. TRUE VARIANCE-BASED GLOBAL SENSITIVITY ANALYSIS
+% This section implements the Jansen/Saltelli estimators with independent A,
+% B, and A_B(i) sample matrices. Unlike the bin-based ranking, these
+% are genuine first-order and total-order variance-based sensitivity indices.
+sobol_names = {'k_leak','k_pH','pH50','k_ROS','K_ROS','k_interaction', ...
+    'k_MPS','k_plaque_in','cap_pH','core_ROS'};
+sobol_bounds = [ ...
+    max(design_bounds(1,1),0.75*selected_dual(1)), min(design_bounds(1,2),1.25*selected_dual(1)); ...
+    max(design_bounds(2,1),0.75*selected_dual(2)), min(design_bounds(2,2),1.25*selected_dual(2)); ...
+    max(6.45,selected_dual(3)-0.15), min(7.05,selected_dual(3)+0.15); ...
+    max(design_bounds(4,1),0.75*selected_dual(4)), min(design_bounds(4,2),1.25*selected_dual(4)); ...
+    max(design_bounds(5,1),0.65*selected_dual(5)), min(design_bounds(5,2),1.35*selected_dual(5)); ...
+    max(design_bounds(6,1),0.50*selected_dual(6)), min(design_bounds(6,2),1.50*selected_dual(6)); ...
+    0.05 0.12; ...
+    0.006 0.015; ...
+    6.75 7.05; ...
+    0.05 0.20];
+
+% Use separate prime bases and sequence offsets for the A and B matrices.
+all_sobol_primes = first_primes(20);
+A_unit = halton_block(settings.n_sobol, 10, 50, all_sobol_primes(1:10));
+B_unit = halton_block(settings.n_sobol, 10, 5000, all_sobol_primes(11:20));
+A = sobol_bounds(:,1)' + A_unit .* (sobol_bounds(:,2)' - sobol_bounds(:,1)');
+B = sobol_bounds(:,1)' + B_unit .* (sobol_bounds(:,2)' - sobol_bounds(:,1)');
+
+% Evaluate the output of interest, the stimulus enhancement ratio (SER).
+fA = zeros(settings.n_sobol,1);
+fB = zeros(settings.n_sobol,1);
+for i = 1:settings.n_sobol
+    fA(i) = evaluate_sobol_row(A(i,:), selected_dual, design_scenario, transport, settings);
+    fB(i) = evaluate_sobol_row(B(i,:), selected_dual, design_scenario, transport, settings);
+end
+output_variance = var([fA; fB], 1);
+first_order = zeros(10,1);
+total_order = zeros(10,1);
+
+% Construct one A_B(i) matrix per parameter and apply Jansen estimators.
+for j = 1:10
+    AB = A;
+    AB(:,j) = B(:,j);
+    fAB = zeros(settings.n_sobol,1);
+    for i = 1:settings.n_sobol
+        fAB(i) = evaluate_sobol_row(AB(i,:), selected_dual, design_scenario, transport, settings);
+    end
+    first_order(j) = 1 - mean((fB-fAB).^2)/(2*output_variance);
+    total_order(j) = mean((fA-fAB).^2)/(2*output_variance);
+end
+
+% Clip small finite-sample excursions outside [0,1] without renormalizing.
+first_order = min(max(first_order,0),1);
+total_order = min(max(total_order,0),1);
+sobol_table = table(sobol_names', first_order, total_order, ...
+    'VariableNames', {'Parameter','First_Order','Total_Order'});
+writetable(sobol_table, fullfile(settings.output_directory, 'sobol_indices.csv'));
+
+fprintf('GLOBAL SENSITIVITY ANALYSIS\n');
+[~, sobol_rank] = sort(total_order, 'descend');
+for j = 1:numel(sobol_rank)
+    idx = sobol_rank(j);
+    fprintf('%-15s S1 %.4f | ST %.4f\n', sobol_names{idx}, first_order(idx), total_order(idx));
+end
+fprintf('\n');
+
+%% SECTION 11. TIME-COURSE SIMULATIONS FOR SELECTED DESIGNS
+% Endpoint screening used the exact linear-system matrix exponential. Here the
+% same matrix is evaluated across a time grid to visualize cumulative plaque
+% exposure and free-drug amounts without changing model assumptions.
+time_grid = linspace(0, settings.analysis_time_h, 145)';
+timecourse_mechanisms = {'baseline','pH','ROS','dual_interaction'};
+timecourse_labels = {'Nonresponsive','pH only','ROS only','Dual + interaction'};
+timecourse_plaque_auc = zeros(numel(time_grid), numel(timecourse_mechanisms));
+
+for m = 1:numel(timecourse_mechanisms)
+    mechanism = timecourse_mechanisms{m};
+    design = selected_designs.(mechanism);
+    A_matrix = build_system_matrix(design, mechanism, design_scenario, transport);
+    initial_state = zeros(15,1);
+    initial_state(1) = settings.initial_normalized_dose;
+    for i = 1:numel(time_grid)
+        state = expm(A_matrix*time_grid(i))*initial_state;
+        timecourse_plaque_auc(i,m) = state(14);
+    end
+end
+
+timecourse_table = array2table([time_grid,timecourse_plaque_auc], 'VariableNames', ...
+    {'Time_h','Nonresponsive_Plaque_AUC','pH_Plaque_AUC','ROS_Plaque_AUC','Dual_Plaque_AUC'});
+writetable(timecourse_table, fullfile(settings.output_directory, 'timecourse.csv'));
+
+%% SECTION 12. FIGURES
+% All figures are generated directly from the saved model results so the text,
+% tables, and plots cannot silently diverge.
+if settings.save_figures
+    % Apply consistent journal-style defaults to all figures created below.
+    set(groot, 'defaultAxesFontName', 'Arial');
+    set(groot, 'defaultAxesFontSize', 11);
+    set(groot, 'defaultAxesLineWidth', 1.0);
+    set(groot, 'defaultLineLineWidth', 1.8);
+    set(groot, 'defaultFigureColor', 'white');
+    % Figure 1: held-out ROS benchmark.
+    figure('Color','w','Position',[100 100 850 520]); hold on;
+    for idx = training_indices
+        plot(benchmark.time_h, benchmark.release_fraction(idx,:)', '-o', ...
+            'DisplayName', sprintf('Training %.1f mM',benchmark.ros_mM(idx)));
+    end
+    scatter(benchmark.time_h, holdout_observed, 45, 's', 'filled', ...
+        'DisplayName','Held-out 5 mM data');
+    plot(benchmark.time_h, holdout_prediction, 'LineWidth',2.2, ...
+        'DisplayName',sprintf('Blind prediction (R^2 = %.3f)',holdout_r2));
+    xlabel('Time (h)'); ylabel('Cumulative release fraction'); ylim([0 0.82]);
+    legend('Location','best'); grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory,'figure1_holdout_validation'), settings.figure_resolution_dpi);
+
+
+    % Figure 2: pH calibration-shape check for a different formulation.
+    figure('Color','w','Position',[100 100 850 520]); hold on;
+    scatter(ph_benchmark.time_h,ph_benchmark.release_pH74,42,'o','filled', ...
+        'DisplayName','pH 7.4 digitized data');
+    plot(ph_benchmark.time_h,ph74_prediction,'LineWidth',2.2, ...
+        'DisplayName',sprintf('pH 7.4 fit (RMSE %.3f)',ph74_rmse));
+    scatter(ph_benchmark.time_h,ph_benchmark.release_pH60,42,'s','filled', ...
+        'DisplayName','pH 6.0 digitized data');
+    plot(ph_benchmark.time_h,ph60_prediction,'LineWidth',2.2, ...
+        'DisplayName',sprintf('pH 6.0 fit (RMSE %.3f)',ph60_rmse));
+    xlabel('Time (h)'); ylabel('Cumulative release fraction'); ylim([0 0.78]);
+    legend('Location','best'); grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory, ...
+        'figure2_ph_calibration'), settings.figure_resolution_dpi);
+
+    % Figure 3: Pareto fronts for responsive mechanisms.
+    figure('Color','w','Position',[100 100 850 520]); hold on;
+    for m = 2:numel(mechanism_codes)
+        mechanism = mechanism_codes{m};
+        pidx = landscapes.(mechanism).pareto_indices;
+        sidx = landscapes.(mechanism).selected_index;
+        scatter(landscapes.(mechanism).off_target_auc(pidx), ...
+            landscapes.(mechanism).plaque_auc(pidx), 22, 'DisplayName',mechanism_labels{m});
+        scatter(landscapes.(mechanism).off_target_auc(sidx), ...
+            landscapes.(mechanism).plaque_auc(sidx), 130, '*', 'LineWidth',1.5, ...
+            'HandleVisibility','off');
+    end
+    xlabel('Off-target free-drug AUC'); ylabel('Plaque free-drug AUC');
+    legend('Location','best'); grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory,'figure3_pareto_mechanisms'), settings.figure_resolution_dpi);
+
+    % Figure 5: scenario analysis with the same ordering as the saved table.
+    figure('Color','w','Position',[100 100 850 520]);
+    yyaxis left; bar(scenario_table.Plaque_AUC); ylabel('Plaque free-drug AUC');
+    yyaxis right; plot(1:height(scenario_table),scenario_table.SER,'-o','LineWidth',2); ylabel('SER');
+    xticks(1:height(scenario_table)); xticklabels(scenario_table.Scenario); xtickangle(15);
+    grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory,'figure5_scenario_analysis'), settings.figure_resolution_dpi);
+
+    % Figure 4: Monte Carlo distribution of the dual SER.
+    figure('Color','w','Position',[100 100 850 520]);
+    histogram(mc_values(:,4),45); hold on;
+    xline(empirical_percentile(mc_values(:,4),2.5),'--');
+    xline(empirical_percentile(mc_values(:,4),50),'-','LineWidth',2);
+    xline(empirical_percentile(mc_values(:,4),97.5),'--');
+    xlabel('Dual-responsive stimulus enhancement ratio'); ylabel('Count');
+    grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory,'figure4_monte_carlo'), settings.figure_resolution_dpi);
+
+    % Figure 6: true first-order and total-order sensitivity indices.
+    [~, order] = sort(total_order, 'ascend');
+    figure('Color','w','Position',[100 100 850 560]);
+    barh([first_order(order),total_order(order)]);
+    yticks(1:numel(order)); yticklabels(sobol_names(order));
+    xlabel('Sensitivity index for SER'); legend({'First-order','Total-order'},'Location','best');
+    grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory,'figure6_sobol'), settings.figure_resolution_dpi);
+
+    % Figure 8: cumulative plaque exposure through time.
+    figure('Color','w','Position',[100 100 850 520]);
+    plot(time_grid,timecourse_plaque_auc,'LineWidth',1.8);
+    xlabel('Time (h)'); ylabel('Cumulative plaque free-drug AUC');
+    legend(timecourse_labels,'Location','best'); grid on; box on;
+    export_publication_figure(gcf, fullfile(settings.output_directory,'figure8_timecourse'), settings.figure_resolution_dpi);
+
+    % Figure 7: exposure-based targeting landscape across pH and ROS.
+    % The left panel is the tissue-exposure analogue of a targeting-index map.
+    % The right panel separates stimulus benefit from passive transport by
+    % normalizing ESR to the matched nonresponsive carrier.
+    figure('Color','w','Position',[70 70 1250 520]);
+    targeting_layout = tiledlayout(1,2,'TileSpacing','compact','Padding','compact');
+
+    nexttile;
+    contourf(map_pH_grid, map_ROS_grid_mM, map_esr, 18, 'LineColor','none');
+    set(gca,'YScale','log','XDir','reverse');
+    colorbar;
+    hold on;
+    scatter([scenarios.cap_pH], [scenarios.cap_ROS_mM], 52, 'o', ...
+        'filled', 'MarkerEdgeColor','k');
+    xlabel('Plaque-cap pH');
+    ylabel('Plaque-cap ROS (mM)');
+    title('Exposure selectivity ratio (ESR)');
+    grid on; box on;
+
+    nexttile;
+    contourf(map_pH_grid, map_ROS_grid_mM, map_ser, 18, 'LineColor','none');
+    set(gca,'YScale','log','XDir','reverse');
+    colorbar;
+    hold on;
+    scatter([scenarios.cap_pH], [scenarios.cap_ROS_mM], 52, 'o', ...
+        'filled', 'MarkerEdgeColor','k');
+    plot(map_max_pH, map_max_ROS_mM, 'kp', 'MarkerSize',13, ...
+        'MarkerFaceColor','w', 'LineWidth',1.4);
+    xlabel('Plaque-cap pH');
+    ylabel('Plaque-cap ROS (mM)');
+    title('Stimulus enhancement ratio (SER)');
+    grid on; box on;
+
+    title(targeting_layout, ...
+        'Exposure-based targeting landscape (transport held constant)');
+    export_publication_figure(gcf, ...
+        fullfile(settings.output_directory,'figure7_exposure_targeting_map'), ...
+        settings.figure_resolution_dpi);
+
+    % Supplementary Figure S1: three-dimensional SER response surface paired
+    % with a top-down contour map. The 3D panel emphasizes response curvature,
+    % whereas the contour panel preserves accurate localization of pH/ROS
+    % regions. Scenario markers are evaluated on the same fixed-transport map,
+    % so they are directly comparable to the plotted surface.
+    create_targeting_surface_figure( ...
+        map_pH_grid, map_ROS_grid_mM, map_ser, scenarios, ...
+        'SER', 'Stimulus enhancement ratio', ...
+        'Three-dimensional stimulus-enhancement landscape', ...
+        fullfile(settings.output_directory, ...
+        'figureS1_ser_surface_and_contour'), ...
+        settings.figure_resolution_dpi);
+
+    % Supplementary Figure S2: corresponding ESR surface and contour. This
+    % separates absolute plaque-versus-healthy exposure selectivity from the
+    % stimulus-specific enhancement shown in Figure S1.
+    create_targeting_surface_figure( ...
+        map_pH_grid, map_ROS_grid_mM, map_esr, scenarios, ...
+        'ESR', 'Exposure selectivity ratio', ...
+        'Three-dimensional exposure-selectivity landscape', ...
+        fullfile(settings.output_directory, ...
+        'figureS2_esr_surface_and_contour'), ...
+        settings.figure_resolution_dpi);
+end
+
+%% SECTION 13. SAVE COMPLETE WORKSPACE AND PRINT INTERPRETATION
+% Save a MAT file so every intermediate result can be audited or reused.
+save(fullfile(settings.output_directory,'complete_publication_analysis.mat'));
+
+
+fprintf('KEY INTERPRETIVE RESULTS\n');
+fprintf('1. The 5 mM release curve was withheld during fitting: R^2 = %.3f.\n', holdout_r2);
+fprintf('   Leave-one-concentration-out testing exposed poor 0 mM extrapolation.\n');
+fprintf('2. The interaction term produced only a %.2f%% plaque-AUC increment over the additive model.\n', interaction_plaque_gain_pct);
+fprintf('3. Under uncertainty, dual plaque AUC exceeded ROS-only in %.1f%% of draws,\n',100*mean(mc_values(:,8)>0));
+fprintf('   but dual off-target AUC was also higher in %.1f%% of draws.\n',100*mean(mc_values(:,9)>0));
+fprintf('4. Dual SER exceeded ROS-only SER in only %.1f%% of draws.\n',100*mean(mc_values(:,10)>0));
+fprintf('5. Mass balance and independent solver checks passed within numerical tolerance.\n');
+fprintf('6. Scenario trends are exploratory and do not establish a clinical treatment window.\n\n');
+fprintf('Analysis complete. Results were saved to:\n%s\n',settings.output_directory);
+
+%% ========================================================================
+% LOCAL FUNCTIONS
+% Each function below isolates one scientific or computational operation.
+% Keeping these operations separate improves reproducibility and makes future
+% replacement of transport or release assumptions straightforward.
+%% ========================================================================
+
+function create_targeting_surface_figure(pH_grid, ros_grid_mM, ...
+    metric_grid, scenarios, metric_short_name, metric_long_name, ...
+    figure_title, output_base, resolution_dpi)
+% CREATE_TARGETING_SURFACE_FIGURE Generate paired 3D and contour views.
+%
+% The ROS axis is logarithmic because the landscape spans two orders of
+% magnitude. Scenario markers are interpolated in log10(ROS) space, matching
+% the map sampling. The maximum marker is descriptive only and must not be
+% interpreted as a clinical optimum.
+
+    % Extract the four exploratory cap conditions used elsewhere in the model.
+    scenario_pH = [scenarios.cap_pH];
+    scenario_ros_mM = [scenarios.cap_ROS_mM];
+
+    % Interpolate marker heights in logarithmic ROS coordinates so the
+    % interpolation geometry matches the log-spaced surface grid.
+    scenario_metric = interp2(pH_grid, log10(ros_grid_mM), metric_grid, ...
+        scenario_pH, log10(scenario_ros_mM), 'linear');
+
+    % Locate the highest sampled value for descriptive annotation.
+    [maximum_metric, maximum_linear_index] = max(metric_grid(:));
+    [maximum_row, maximum_column] = ind2sub(size(metric_grid), ...
+        maximum_linear_index);
+    maximum_pH = pH_grid(maximum_row, maximum_column);
+    maximum_ros_mM = ros_grid_mM(maximum_row, maximum_column);
+
+    % Lift markers slightly above the surface so they remain visible.
+    metric_span = max(metric_grid(:)) - min(metric_grid(:));
+    marker_offset = max(0.015 * metric_span, 1e-6);
+
+    figure('Color','w','Position',[70 70 1250 540]);
+    surface_layout = tiledlayout(1,2, ...
+        'TileSpacing','compact','Padding','compact');
+
+    % Panel A: oblique three-dimensional response surface.
+    surface_axes = nexttile(surface_layout);
+    surf(surface_axes, pH_grid, ros_grid_mM, metric_grid, ...
+        'EdgeColor','none','FaceAlpha',1.0);
+    hold(surface_axes,'on');
+    plot3(surface_axes, scenario_pH, scenario_ros_mM, ...
+        scenario_metric + marker_offset, 'ko', 'MarkerSize',6.5, ...
+        'MarkerFaceColor','w','LineWidth',1.2);
+    plot3(surface_axes, maximum_pH, maximum_ros_mM, ...
+        maximum_metric + marker_offset, 'kp', 'MarkerSize',13, ...
+        'MarkerFaceColor','w','LineWidth',1.4);
+
+    % Label scenarios numerically to avoid a long, obstructive legend.
+    for scenario_index = 1:numel(scenarios)
+        text(surface_axes, scenario_pH(scenario_index), ...
+            scenario_ros_mM(scenario_index), ...
+            scenario_metric(scenario_index) + 2.2*marker_offset, ...
+            sprintf('S%d',scenario_index), ...
+            'FontSize',9,'FontWeight','bold', ...
+            'HorizontalAlignment','center');
+    end
+
+    set(surface_axes,'YScale','log','XDir','reverse');
+    view(surface_axes,-48,30);
+    axis(surface_axes,'tight');
+    grid(surface_axes,'on');
+    box(surface_axes,'on');
+    xlabel(surface_axes,'Plaque-cap pH');
+    ylabel(surface_axes,'Plaque-cap ROS (mM)');
+    zlabel(surface_axes,metric_short_name);
+    title(surface_axes,sprintf('3D %s surface',metric_short_name));
+    colormap(surface_axes,parula(256));
+    surface_colorbar = colorbar(surface_axes);
+    surface_colorbar.Label.String = metric_short_name;
+
+    % Panel B: top-down contour map for more precise regional interpretation.
+    contour_axes = nexttile(surface_layout);
+    contourf(contour_axes, pH_grid, ros_grid_mM, metric_grid, ...
+        18,'LineColor','none');
+    hold(contour_axes,'on');
+    scatter(contour_axes, scenario_pH, scenario_ros_mM, 52, 'o', ...
+        'filled','MarkerEdgeColor','k');
+    plot(contour_axes, maximum_pH, maximum_ros_mM, 'kp', ...
+        'MarkerSize',13,'MarkerFaceColor','w','LineWidth',1.4);
+
+    for scenario_index = 1:numel(scenarios)
+        text(contour_axes, scenario_pH(scenario_index), ...
+            scenario_ros_mM(scenario_index), ...
+            sprintf('  S%d',scenario_index), ...
+            'FontSize',9,'FontWeight','bold', ...
+            'VerticalAlignment','middle');
+    end
+
+    set(contour_axes,'YScale','log','XDir','reverse');
+    grid(contour_axes,'on');
+    box(contour_axes,'on');
+    xlabel(contour_axes,'Plaque-cap pH');
+    ylabel(contour_axes,'Plaque-cap ROS (mM)');
+    title(contour_axes,sprintf('Top-down %s contour',metric_short_name));
+    colormap(contour_axes,parula(256));
+    contour_colorbar = colorbar(contour_axes);
+    contour_colorbar.Label.String = metric_short_name;
+
+    title(surface_layout, sprintf('%s (transport held constant)', ...
+        figure_title));
+
+    % Add a concise interpretation note without implying clinical optimality.
+    annotation(gcf,'textbox',[0.12 0.005 0.76 0.045], ...
+        'String',sprintf(['Surface height represents %s. The star marks the ' ...
+        'highest sampled grid value, not a clinical optimum.'], ...
+        metric_long_name), ...
+        'EdgeColor','none','HorizontalAlignment','center', ...
+        'FontSize',9);
+
+    export_publication_figure(gcf, output_base, resolution_dpi);
+end
+
+function export_publication_figure(fig_handle, output_base, resolution_dpi)
+% EXPORT_PUBLICATION_FIGURE Save one plot in three publication-ready formats.
+% PNG: high-resolution raster image for Word, posters, and online submission.
+% PDF: vector artwork that remains sharp when enlarged.
+% FIG: editable MATLAB figure for later label, legend, or layout changes.
+
+    % Use a consistent manuscript-width canvas.
+    set(fig_handle, 'Units', 'inches', 'Position', [1 1 7.2 4.8], ...
+        'PaperPositionMode', 'auto', 'Color', 'white');
+
+    % Standardize axes, labels, and plotted objects without changing data.
+    axes_handles = findall(fig_handle, 'Type', 'axes');
+    for axis_index = 1:numel(axes_handles)
+        set(axes_handles(axis_index), 'FontName', 'Arial', 'FontSize', 11, ...
+            'LineWidth', 1.0, 'Box', 'off', 'TickDir', 'out');
+    end
+
+    line_handles = findall(fig_handle, 'Type', 'line');
+    for line_index = 1:numel(line_handles)
+        if get(line_handles(line_index), 'LineWidth') < 1.5
+            set(line_handles(line_index), 'LineWidth', 1.5);
+        end
+    end
+
+    % Write a 600-DPI PNG for documents and posters.
+    exportgraphics(fig_handle, [output_base '.png'], ...
+        'Resolution', resolution_dpi, 'BackgroundColor', 'white');
+
+    % Write a true vector PDF for journals and lossless resizing.
+    exportgraphics(fig_handle, [output_base '.pdf'], ...
+        'ContentType', 'vector', 'BackgroundColor', 'white');
+
+    % Preserve an editable MATLAB copy.
+    savefig(fig_handle, [output_base '.fig']);
+end
+
+function parameters = unconstrained_to_bounded(theta, lower, upper)
+% Map unconstrained fminsearch variables to finite physical bounds.
+    parameters = lower + (upper-lower) ./ (1 + exp(-theta));
+end
+
+function theta = bounded_to_unconstrained(parameters, lower, upper)
+% Invert the logistic map so a physically meaningful initial guess can be used.
+    scaled = (parameters-lower) ./ (upper-lower);
+    scaled = min(max(scaled,1e-10),1-1e-10);
+    theta = log(scaled ./ (1-scaled));
+end
+
+function sse = ros_benchmark_sse(theta, benchmark, training_indices, lower, upper)
+% Calculate training squared error for the reduced ROS release benchmark.
+    parameters = unconstrained_to_bounded(theta, lower, upper);
+    errors = [];
+    for idx = training_indices
+        prediction = ros_benchmark_model(parameters, benchmark.time_h, benchmark.ros_mM(idx));
+        observed = benchmark.release_fraction(idx,:)';
+        errors = [errors; prediction-observed]; %#ok<AGROW>
+    end
+    sse = sum(errors.^2);
+end
+
+function release = ros_benchmark_model(parameters, time_h, ros_mM)
+% Predict in-vitro release using concentration-dependent rate and plateau terms.
+    k0 = parameters(1);
+    kmax = parameters(2);
+    K = parameters(3);
+    hill_rate = parameters(4);
+    F0 = parameters(5);
+    amplitude = parameters(6);
+    K_plateau = parameters(7);
+    hill_plateau = parameters(8);
+
+    rate = k0 + kmax * ros_mM^hill_rate / ...
+        (K^hill_rate + ros_mM^hill_rate + eps);
+    plateau = F0 + amplitude * ros_mM^hill_plateau / ...
+        (K_plateau^hill_plateau + ros_mM^hill_plateau + eps);
+    release = plateau .* (1-exp(-rate.*time_h));
+end
+
+
+function sse = plateau_release_sse(theta,time_h,observed,lower,upper)
+% Calculate squared error for a bounded plateau-times-first-order model.
+    parameters = unconstrained_to_bounded(theta,lower,upper);
+    prediction = plateau_release_model(parameters,time_h);
+    sse = sum((prediction-observed).^2);
+end
+
+function release = plateau_release_model(parameters,time_h)
+% Calculate release = plateau * (1-exp(-k*time)).
+    plateau = parameters(1);
+    rate = parameters(2);
+    release = plateau .* (1-exp(-rate.*time_h));
+end
+
+function transport = default_transport_parameters()
+% Return the transparent reference set of systemic transport/clearance rates.
+    transport.k_mps = 0.080;
+    transport.k_np_loss = 0.006;
+    transport.k_h_in = 0.006;
+    transport.k_h_out = 0.010;
+    transport.k_h_loss = 0.005;
+    transport.k_p_in = 0.010;
+    transport.k_p_out = 0.004;
+    transport.k_p_loss = 0.004;
+    transport.k_capcore = 0.012;
+    transport.k_core_back = 0.002;
+    transport.k_core_loss = 0.003;
+    transport.k_d_h_in = 0.008;
+    transport.k_d_h_out = 0.006;
+    transport.k_d_p_in = 0.006;
+    transport.k_d_p_out = 0.003;
+    transport.k_d_capcore = 0.015;
+    transport.k_d_corecap = 0.004;
+    transport.k_elim_b = 0.120;
+    transport.k_elim_h = 0.050;
+    transport.k_elim_p = 0.035;
+    transport.k_elim_core = 0.025;
+    transport.k_elim_mps = 0.060;
+end
+
+function activation = ph_activation(pH, pH50)
+% Return dimensionless acid activation using a base-10 logistic relationship.
+    hill_pH = 2.5;
+    activation = 1 ./ (1 + 10.^(hill_pH.*(pH-pH50)));
+end
+
+function activation = ros_activation(ros_mM, K_ros_mM)
+% Return dimensionless ROS activation using a Hill saturation relationship.
+    hill_ros = 1.3;
+    activation = ros_mM.^hill_ros ./ ...
+        (K_ros_mM.^hill_ros + ros_mM.^hill_ros + eps);
+end
+
+function rate = local_release_rate(pH, ros_mM, design, mechanism)
+% Calculate a dimensionally consistent first-order release rate in h^-1.
+    k_leak = design(1);
+    k_pH = design(2);
+    pH50 = design(3);
+    k_ROS = design(4);
+    K_ROS = design(5);
+    k_interaction = design(6);
+
+    f_pH = ph_activation(pH,pH50);
+    f_ROS = ros_activation(ros_mM,K_ROS);
+
+    switch mechanism
+        case 'baseline'
+            rate = k_leak;
+        case 'pH'
+            rate = k_leak + k_pH*f_pH;
+        case 'ROS'
+            rate = k_leak + k_ROS*f_ROS;
+        case 'dual_additive'
+            rate = k_leak + k_pH*f_pH + k_ROS*f_ROS;
+        case 'dual_interaction'
+            rate = k_leak + k_pH*f_pH + k_ROS*f_ROS + ...
+                k_interaction*f_pH*f_ROS;
+        otherwise
+            error('Unknown mechanism: %s',mechanism);
+    end
+end
+
+function A = build_system_matrix(design, mechanism, scenario, transport)
+% Construct the 15-state linear ODE matrix for transport, release, and AUC.
+% State order:
+% 1-5 bound NP: blood, MPS, healthy wall, plaque cap, plaque core.
+% 6-10 free drug: blood, MPS, healthy wall, plaque cap, plaque core.
+% 11-14 cumulative AUC: blood, MPS, healthy wall, total plaque.
+% 15 cumulative irreversible loss/elimination sink for mass-balance checks.
+
+    tr = transport;
+    tr.k_p_in = scenario.k_plaque_in;
+    tr.k_capcore = scenario.k_cap_core;
+
+    k_blood = local_release_rate(7.4,0.005,design,mechanism);
+    k_mps_release = local_release_rate(7.2,0.020,design,mechanism);
+    k_healthy = local_release_rate(7.4,0.005,design,mechanism);
+    k_cap = local_release_rate(scenario.cap_pH,scenario.cap_ROS_mM,design,mechanism);
+    k_core = local_release_rate(scenario.core_pH,scenario.core_ROS_mM,design,mechanism);
+
+    A = zeros(15,15);
+    Nb=1; Nm=2; Nh=3; Nc=4; Ncore=5;
+    Db=6; Dm=7; Dh=8; Dc=9; Dcore=10;
+    AUCb=11; AUCm=12; AUCh=13; AUCp=14; Cleared=15;
+
+    A(Nb,Nb) = -(tr.k_mps+tr.k_h_in+tr.k_p_in+tr.k_np_loss+k_blood);
+    A(Nb,Nh) = tr.k_h_out;
+    A(Nb,Nc) = tr.k_p_out;
+
+    A(Nm,Nb) = tr.k_mps;
+    A(Nm,Nm) = -(tr.k_np_loss+k_mps_release);
+
+    A(Nh,Nb) = tr.k_h_in;
+    A(Nh,Nh) = -(tr.k_h_out+tr.k_h_loss+k_healthy);
+
+    A(Nc,Nb) = tr.k_p_in;
+    A(Nc,Ncore) = tr.k_core_back;
+    A(Nc,Nc) = -(tr.k_p_out+tr.k_capcore+tr.k_p_loss+k_cap);
+
+    A(Ncore,Nc) = tr.k_capcore;
+    A(Ncore,Ncore) = -(tr.k_core_back+tr.k_core_loss+k_core);
+
+    A(Db,Nb) = k_blood;
+    A(Db,Db) = -(tr.k_elim_b+tr.k_d_h_in+tr.k_d_p_in);
+    A(Db,Dh) = tr.k_d_h_out;
+    A(Db,Dc) = tr.k_d_p_out;
+
+    A(Dm,Nm) = k_mps_release;
+    A(Dm,Dm) = -tr.k_elim_mps;
+
+    A(Dh,Nh) = k_healthy;
+    A(Dh,Db) = tr.k_d_h_in;
+    A(Dh,Dh) = -(tr.k_elim_h+tr.k_d_h_out);
+
+    A(Dc,Nc) = k_cap;
+    A(Dc,Db) = tr.k_d_p_in;
+    A(Dc,Dcore) = tr.k_d_corecap;
+    A(Dc,Dc) = -(tr.k_elim_p+tr.k_d_p_out+tr.k_d_capcore);
+
+    A(Dcore,Ncore) = k_core;
+    A(Dcore,Dc) = tr.k_d_capcore;
+    A(Dcore,Dcore) = -(tr.k_elim_core+tr.k_d_corecap);
+
+    A(AUCb,Db) = 1;
+    A(AUCm,Dm) = 1;
+    A(AUCh,Dh) = 1;
+    A(AUCp,Dc) = 1;
+    A(AUCp,Dcore) = 1;
+
+    % Accumulate every irreversible carrier-loss and free-drug elimination
+    % pathway in one sink state. This state does not feed back into exposure.
+    A(Cleared,Nb) = tr.k_np_loss;
+    A(Cleared,Nm) = tr.k_np_loss;
+    A(Cleared,Nh) = tr.k_h_loss;
+    A(Cleared,Nc) = tr.k_p_loss;
+    A(Cleared,Ncore) = tr.k_core_loss;
+    A(Cleared,Db) = tr.k_elim_b;
+    A(Cleared,Dm) = tr.k_elim_mps;
+    A(Cleared,Dh) = tr.k_elim_h;
+    A(Cleared,Dc) = tr.k_elim_p;
+    A(Cleared,Dcore) = tr.k_elim_core;
+end
+
+function result = simulate_endpoint(design, mechanism, scenario, transport, time_h, dose)
+% Evaluate the exact endpoint of the linear compartment model with expm.
+    A = build_system_matrix(design, mechanism, scenario, transport);
+    initial_state = zeros(15,1);
+    initial_state(1) = dose;
+    final_state = expm(A*time_h)*initial_state;
+
+    result.blood_auc = final_state(11);
+    result.mps_auc = final_state(12);
+    result.healthy_auc = final_state(13);
+    result.plaque_auc = final_state(14);
+    result.off_target_auc = result.blood_auc + result.mps_auc + result.healthy_auc;
+    result.exposure_selectivity_ratio = result.plaque_auc / max(result.healthy_auc,eps);
+    result.exposure_efficiency = result.plaque_auc / ...
+        max(result.plaque_auc+result.off_target_auc,eps);
+end
+
+function sequence = halton_block(n, dimensions, start_index, bases)
+% Generate a deterministic low-discrepancy Halton block without a toolbox.
+    if nargin < 4
+        bases = first_primes(dimensions);
+    end
+    sequence = zeros(n,dimensions);
+    for j = 1:dimensions
+        sequence(:,j) = van_der_corput(n,bases(j),start_index);
+    end
+end
+
+function values = van_der_corput(n, base, start_index)
+% Generate one radical-inverse sequence used as a Halton dimension.
+    values = zeros(n,1);
+    for row = 1:n
+        integer = row-1+start_index;
+        fraction = 1;
+        radical = 0;
+        while integer > 0
+            fraction = fraction/base;
+            radical = radical + fraction*mod(integer,base);
+            integer = floor(integer/base);
+        end
+        values(row) = radical;
+    end
+end
+
+function primes_out = first_primes(n)
+% Return the first n prime numbers using trial division.
+    primes_out = zeros(1,n);
+    candidate = 2;
+    count = 0;
+    while count < n
+        is_prime = true;
+        for j = 1:count
+            p = primes_out(j);
+            if p*p > candidate
+                break;
+            end
+            if mod(candidate,p) == 0
+                is_prime = false;
+                break;
+            end
+        end
+        if is_prime
+            count = count+1;
+            primes_out(count) = candidate;
+        end
+        candidate = candidate+1;
+    end
+end
+
+function [pareto_indices, selected_index] = pareto_knee(plaque_auc, off_target_auc)
+% Find nondominated points and select the point nearest the normalized ideal.
+    n = numel(plaque_auc);
+    is_pareto = true(n,1);
+    for i = 1:n
+        dominates_i = plaque_auc >= plaque_auc(i) & off_target_auc <= off_target_auc(i) & ...
+            (plaque_auc > plaque_auc(i) | off_target_auc < off_target_auc(i));
+        if any(dominates_i)
+            is_pareto(i) = false;
+        end
+    end
+    pareto_indices = find(is_pareto);
+    p = plaque_auc(pareto_indices);
+    o = off_target_auc(pareto_indices);
+    p_norm = (p-min(p)) ./ max(max(p)-min(p),eps);
+    o_norm = (max(o)-o) ./ max(max(o)-min(o),eps);
+    distance_to_ideal = sqrt((1-p_norm).^2+(1-o_norm).^2);
+    [~,local_index] = min(distance_to_ideal);
+    selected_index = pareto_indices(local_index);
+end
+
+function multiplier = lognormal_multiplier(z, coefficient_of_variation)
+% Convert a standard-normal deviate to a mean-one lognormal multiplier.
+    sigma = sqrt(log(1+coefficient_of_variation^2));
+    multiplier = exp(-0.5*sigma^2 + sigma*z);
+end
+
+function clipped = clip_value(value, lower, upper)
+% Restrict a scalar value to a closed interval.
+    clipped = min(max(value,lower),upper);
+end
+
+function clipped = clip_vector(values, lower, upper)
+% Restrict each vector component to its corresponding closed interval.
+    clipped = min(max(values,lower),upper);
+end
+
+function percentile = empirical_percentile(values, probability_percent)
+% Calculate a linearly interpolated percentile without prctile.
+    sorted_values = sort(values(:));
+    n = numel(sorted_values);
+    position = 1 + (n-1)*(probability_percent/100);
+    lower_index = floor(position);
+    upper_index = ceil(position);
+    if lower_index == upper_index
+        percentile = sorted_values(lower_index);
+    else
+        weight = position-lower_index;
+        percentile = sorted_values(lower_index)*(1-weight) + sorted_values(upper_index)*weight;
+    end
+end
+
+function output = evaluate_sobol_row(row, selected_dual, scenario, transport, settings)
+% Map one Sobol row to design/transport/scenario values and return SER.
+    design = selected_dual;
+    design(1:6) = row(1:6);
+    sampled_transport = transport;
+    sampled_transport.k_mps = row(7);
+    sampled_scenario = scenario;
+    sampled_scenario.k_plaque_in = row(8);
+    sampled_scenario.cap_pH = row(9);
+    sampled_scenario.core_ROS_mM = row(10);
+
+    responsive = simulate_endpoint(design,'dual_interaction',sampled_scenario, ...
+        sampled_transport,settings.analysis_time_h,settings.initial_normalized_dose);
+    baseline = simulate_endpoint(design,'baseline',sampled_scenario, ...
+        sampled_transport,settings.analysis_time_h,settings.initial_normalized_dose);
+    output = responsive.exposure_selectivity_ratio / ...
+        max(baseline.exposure_selectivity_ratio,eps);
+end
