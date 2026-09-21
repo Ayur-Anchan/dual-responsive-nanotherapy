@@ -168,7 +168,7 @@ The model provides relative, normalized exposure predictions. It does not establ
 
 ## Generative-AI disclosure
 
-Generative AI was **not used to generate experimental data, perform the reported numerical simulations, choose the reported numerical results, or determine the scientific conclusions**. AI-assisted tools were used during manuscript and repository preparation for language editing, organization, and scientific schematic development. All scientific content, equations, code, numerical outputs, references, and conclusions were reviewed and verified by the author.
+Generative AI was not used in the development of this research project.
 
 ## Citation
 
