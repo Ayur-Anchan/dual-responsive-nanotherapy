@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite the associated manuscript and this software release."
+title: "Computational Optimization of pH/ROS Dual-Responsive Nanoparticle Systems for Targeted Atherosclerosis Therapy"
+type: software
+authors:
+  - family-names: "Anchan"
+    given-names: "Ayur"
+repository-code: "https://github.com/Ayur-Anchan/dual-responsive-nanotherapy"
+license: "GPL-3.0"
