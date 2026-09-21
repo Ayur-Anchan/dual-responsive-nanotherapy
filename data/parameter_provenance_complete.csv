@@ -1,0 +1,47 @@
+<PARSED TEXT FOR SHEET: 1 / 1 TABS
+TAB NAME: parameter_provenance_complete.csv>
+index,Parameter,Units,Reference_Value,Range_or_Uncertainty,Calibration_Status,Evidence_Source,Physiological_Justification
+0,k_leak,h^-1,0.00128466796875,0.001-0.012; lognormal CV 0.15,Screened effective,"[10,11,23,24]",Stimulus-independent carrier leakage
+1,k_pH,h^-1,0.1194970278920896,0.020-0.120; lognormal CV 0.15,Screened effective,"[10,11,23,24]",Maximum pH-dependent release contribution
+2,pH50,- ,6.630896,"6.550-6.950; normal SD 0.08, clipped",Screened effective,"[23,24]",pH transition midpoint
+3,k_ROS,h^-1,0.0945022907122032,0.020-0.150; lognormal CV 0.15,Screened effective,"[21,22,25,26]",Maximum ROS-dependent release contribution
+4,K_ROS,mM,0.4232634382897343,0.200-2.000; lognormal CV 0.15,Screened effective,"[21,22,25,26]",Half-activation ROS concentration
+5,k_interaction,h^-1,0.0513427401001365,0-0.060; lognormal CV 0.15,Phenomenological,"[21-24,35]",Additional simultaneous pH/ROS release
+6,n_pH,- ,2.5,Fixed,Fixed assumed,Model structure,Steepness of pH response
+7,n_ROS,- ,1.3,Fixed,Fixed assumed,Model structure,Steepness of ROS response
+8,k_mps,h^-1,0.08,0.080; lognormal CV 0.25,Literature-informed effective,[13-20],MPS uptake
+9,k_np_loss,h^-1,0.006,Fixed,Assumed,Model bookkeeping,Irreversible carrier loss
+10,k_h_in,h^-1,0.006,0.006; lognormal CV 0.25,Literature-informed effective,[13-20],Healthy-wall carrier entry
+11,k_h_out,h^-1,0.01,Fixed,Assumed,Model structure,Healthy-wall carrier return
+12,k_h_loss,h^-1,0.005,Fixed,Assumed,Model structure,Healthy-wall carrier loss
+13,k_p_in,h^-1,0.01,0.006-0.016 by scenario; lognormal CV 0.30,Exploratory scenario input,[28-34],Plaque entry
+14,k_p_out,h^-1,0.004,0.004; lognormal CV 0.25,Literature-informed effective,[13-20],Plaque carrier return
+15,k_p_loss,h^-1,0.004,Fixed,Assumed,Model structure,Plaque carrier loss
+16,k_capcore,h^-1,0.012,0.004-0.012 by scenario; lognormal CV 0.40,Exploratory scenario input,[28-34],Cap-to-core carrier exchange
+17,k_core_back,h^-1,0.002,Fixed,Assumed,Model structure,Core-to-cap carrier exchange
+18,k_core_loss,h^-1,0.003,Fixed,Assumed,Model structure,Core carrier loss
+19,k_d_h_in,h^-1,0.008,0.008; lognormal CV 0.25,Literature-informed effective,[13-20],Free-drug entry into healthy wall
+20,k_d_h_out,h^-1,0.006,Fixed,Assumed,Model structure,Free-drug return from healthy wall
+21,k_d_p_in,h^-1,0.006,Fixed,Assumed,Model structure,Free-drug entry into plaque
+22,k_d_p_out,h^-1,0.003,Fixed,Assumed,Model structure,Free-drug return from plaque
+23,k_d_capcore,h^-1,0.015,Fixed,Assumed,Model structure,Free-drug cap-to-core transport
+24,k_d_corecap,h^-1,0.004,Fixed,Assumed,Model structure,Free-drug core-to-cap transport
+25,k_elim_b,h^-1,0.12,0.120; lognormal CV 0.20,Literature-informed effective,"[6-9,13-20]",Systemic free-drug elimination
+26,k_elim_h,h^-1,0.05,Fixed,Assumed,Model structure,Healthy-wall elimination
+27,k_elim_p,h^-1,0.035,0.035; lognormal CV 0.20,Literature-informed effective,[6-9],Plaque free-drug elimination
+28,k_elim_core,h^-1,0.025,Fixed,Assumed,Model structure,Core free-drug elimination
+29,k_elim_mps,h^-1,0.06,0.060; lognormal CV 0.20,Literature-informed effective,[13-20],MPS-associated elimination
+30,Cap pH,- ,6.9,6.60-7.05 by scenario; normal SD 0.10,Exploratory scenario input,"[2-5,28-35]",Plaque cap microenvironment
+31,Core pH,- ,6.7,6.25-6.95 by scenario; normal SD 0.12,Exploratory scenario input,"[2-5,28-35]",Plaque core microenvironment
+32,Cap ROS,mM,0.05,0.020-0.150 by scenario; lognormal CV 0.35,Exploratory scenario input,"[2-5,27-35]",Plaque cap oxidative stimulus
+33,Core ROS,mM,0.1,0.040-0.400 by scenario; lognormal CV 0.35,Exploratory scenario input,"[2-5,27-35]",Plaque core oxidative stimulus
+34,Plaque entry,h^-1,0.01,0.006-0.016 by scenario; lognormal CV 0.30,Exploratory scenario input,[28-34],Effective plaque entry
+35,Cap-core exchange,h^-1,0.012,0.004-0.012 by scenario; lognormal CV 0.40,Exploratory scenario input,[28-34],Effective intraplaque exchange
+36,ROS benchmark k0,h^-1,0.3195,Fitted; bounded 0.001-0.800,Calibrated,[25],Baseline concentration-dependent release rate
+37,ROS benchmark kmax,h^-1,1.5,Fitted upper bound,Calibrated / weakly identified,[25],Maximum concentration-dependent release rate
+38,ROS benchmark K,mM,8.4957,Fitted,Calibrated,[25],Half-activation of rate response
+39,ROS benchmark Hill n,- ,4.0,Fitted upper bound,Calibrated / weakly identified,[25],Shape of ROS rate response
+40,ROS benchmark F0,- ,0.134,Fitted,Calibrated,[25],Baseline release fraction
+41,ROS benchmark amplitude,- ,0.8,Fitted upper bound,Calibrated / weakly identified,[25],Concentration-dependent plateau contribution
+42,ROS benchmark K_plateau,mM,6.1299,Fitted,Calibrated,[25],Plateau concentration dependence
+43,ROS benchmark Hill m,- ,1.3816,Fitted,Calibrated,[25],Plateau response shape
