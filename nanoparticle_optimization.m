@@ -1,6 +1,6 @@
 %% LEGACY ENTRY POINT
-% This filename is retained for compatibility with earlier versions of the
-% repository. The publication analysis is implemented in:
+% This filename is retained for compatibility with earlier repository versions.
+% The current publication analysis is implemented in:
 %   nanoparticle_optimization_submission_ready_v2.m
 %
 % Running this file executes the current transport-aware analysis.
