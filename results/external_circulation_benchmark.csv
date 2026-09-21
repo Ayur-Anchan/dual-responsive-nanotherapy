@@ -1,0 +1,5 @@
+<PARSED TEXT FOR SHEET: 1 / 1 TABS
+TAB NAME: external_circulation_benchmark.csv>index,Source,Metric,Value,Units,Basis,Interpretation
+0,Current model: selected dual-responsive design,Modeled blood-bound nanoparticle half-life,6.6269,h,Independent reproduction of final compartment model,Exploratory model output
+1,Yang et al. 2025 [25],OPDH-SV blood half-life,21.06,h,Published HPLC pharmacokinetic measurement,Cross-formulation contextual benchmark
+2,Duivenvoorden et al. 2014 [32],[S]-rHDL DiO plasma half-life,21.9,h,Published dual-label nanoparticle pharmacokinetic measurement,Cross-formulation contextual benchmark
